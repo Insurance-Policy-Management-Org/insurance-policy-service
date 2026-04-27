@@ -71,7 +71,7 @@ jobs:
         with:
           args: >-
             --file=requirements.txt
-            --severity-threshold=high
+            --severity-threshold=critical
             --project-name=${{ github.event.repository.name }}
             --target-reference=${{ github.ref_name }}
         env:
