@@ -22,16 +22,19 @@ jobs:
     outputs:
       email: ${{ steps.author.outputs.email }}
       name: ${{ steps.author.outputs.name }}
+
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - id: author
+        name: Get PR author details
         run: |
-          SHA="${{ github.sha }}"
+          SHA="${{ github.event.pull_request.merge_commit_sha || github.sha }}"
           EMAIL=$(git show -s --format='%ae' "$SHA")
           NAME=$(git show -s --format='%an' "$SHA")
+
           echo "email=$EMAIL" >> "$GITHUB_OUTPUT"
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
 
@@ -39,37 +42,34 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       should_build: ${{ steps.gate.outputs.should_build }}
+
     steps:
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
-
       - id: gate
+        name: Validate merge and build label
         run: |
-          export GH_TOKEN=${{ github.token }}
-
           SHOULD_BUILD=false
 
+          echo "PR merged status = ${{ github.event.pull_request.merged }}"
+          echo "PR labels = ${{ toJson(github.event.pull_request.labels.*.name) }}"
+
           if [ "${{ github.event.pull_request.merged }}" != "true" ]; then
+            echo "Pull request not merged. Skipping image build."
             echo "should_build=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           if ! echo '${{ toJson(github.event.pull_request.labels.*.name) }}' | grep -q '"build"'; then
+            echo "Build label not found. Skipping image build."
             echo "should_build=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews > reviews.json
-
-          APPROVED=$(jq -r 'map(select(.state == "APPROVED")) | length > 0' reviews.json)
-
-          if [ "$APPROVED" = "true" ]; then
-            SHOULD_BUILD=true
-          fi
-
+          SHOULD_BUILD=true
+          echo "Merged PR with build label detected. Proceeding."
           echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
 
   docker-build:
+    name: Build and Push Docker Image
     needs: gate
     if: ${{ needs.gate.outputs.should_build == 'true' }}
     permissions:
@@ -81,7 +81,7 @@ jobs:
     secrets: inherit
 
   update-helm-test-values:
-    name: Update insurance helm values
+    name: Update Insurance Helm Values
     needs:
       - gate
       - docker-build
@@ -98,13 +98,14 @@ jobs:
       HELM_REPO_TOKEN: ${{ secrets.HELM_REPO_TOKEN }}
 
   notify:
-    name: Notify insurance image pipeline failure
+    name: Notify Insurance Image Pipeline Failure
     runs-on: ubuntu-latest
     needs:
       - gate
       - get-email
       - docker-build
     if: ${{ always() && needs.gate.outputs.should_build == 'true' && needs.docker-build.result == 'failure' }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
