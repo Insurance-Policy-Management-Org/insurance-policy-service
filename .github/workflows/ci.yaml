@@ -1,34 +1,80 @@
-name: Policy Service PR CI
+name: Insurance Chat CI
 
 on:
   pull_request:
-    branches:
-      - main
-    types:
-      - opened
-      - synchronize
-      - reopened
-      - ready_for_review
-  workflow_dispatch:
+    types: [opened, synchronize]
+
+concurrency:
+  group: insurance-chat-ci-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
-  ci:
-    uses: Insurance-Policy-Management-Org/insurance-policy-management/.github/workflows/reusable-ci-template.yaml@main
-    with:
-      service_name: policy-service
-      dockerfile_path: Dockerfile
-      image_name: policy-service
-      helm_chart_path: policy-service
-      run_quality_scans: true
-      run_build_and_deploy: false
-    secrets:
-      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
-      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-      SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-      SMTP_HOST: ${{ secrets.SMTP_HOST }}
-      SMTP_PORT: ${{ secrets.SMTP_PORT }}
-      SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
-      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-      SMTP_FROM: ${{ secrets.SMTP_FROM }}
-      SMTP_TO: ${{ secrets.SMTP_TO }}
+  get-email:
+    runs-on: ubuntu-latest
+    outputs:
+      email: ${{ steps.author.outputs.email }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: author
+        name: Extract Commit Author Email
+        run: |
+          SHA="${{ github.event.pull_request.head.sha }}"
+          EMAIL=$(git show -s --format='%ae' "$SHA" || echo "")
+          echo "email=$EMAIL" >> "$GITHUB_OUTPUT"
+
+  sonar-scan:
+    uses: ./.github/workflows/ci-sonar-check.yaml
+    secrets: inherit
+
+  snyk-scan:
+    needs: sonar-scan
+    if: ${{ needs.sonar-scan.outputs.quality_gate_status == 'PASSED' }}
+    uses: ./.github/workflows/ci-snyk-check.yaml
+    secrets: inherit
+
+  notify:
+    needs: [sonar-scan, snyk-scan, get-email]
+    if: ${{ always() && 
+      (needs.sonar-scan.outputs.quality_gate_status == 'FAILED' || 
+       needs.snyk-scan.outputs.snyk_status == 'failure') }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sonar Failure Notification
+        if: ${{ needs.sonar-scan.outputs.quality_gate_status == 'FAILED' }}
+        uses: ./.github/actions/send-notification
+        with:
+          pipeline_name: ${{ github.workflow }}
+          repository_name: ${{ github.repository }}
+          failure_reason: ${{ needs.sonar-scan.outputs.notify_summary }}
+          author: ${{ github.event.pull_request.user.login }}
+          smtp_username: ${{ secrets.SMTP_USERNAME }}
+          smtp_password: ${{ secrets.SMTP_PASSWORD }}
+          mail_from: ${{ secrets.MAIL_FROM }}
+          mail_to: ${{ needs.get-email.outputs.email || secrets.MAIL_TO || secrets.MAIL_FROM }}
+          workflow_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          report_url: ${{ secrets.SONAR_HOST_URL }}/dashboard?id=${{ secrets.SONAR_PROJECT_KEY }}
+
+      - name: Snyk Failure Notification
+        if: ${{ needs.snyk-scan.outputs.snyk_status == 'failure' }}
+        uses: ./.github/actions/send-notification
+        with:
+          pipeline_name: ${{ github.workflow }}
+          repository_name: ${{ github.repository }}
+          failure_reason: ${{ needs.snyk-scan.outputs.notify_summary }}
+          author: ${{ github.event.pull_request.user.login }}
+          smtp_username: ${{ secrets.SMTP_USERNAME }}
+          smtp_password: ${{ secrets.SMTP_PASSWORD }}
+          mail_from: ${{ secrets.MAIL_FROM }}
+          mail_to: ${{ needs.get-email.outputs.email || secrets.MAIL_TO || secrets.MAIL_FROM }}
+          workflow_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          report_url: https://app.snyk.io/org/${{ secrets.SNYK_ORG }}/projects/${{ secrets.SNYK_PROJECT_ID }}

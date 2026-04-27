@@ -1,57 +1,74 @@
-name: Policy Service Release
+name: Insurance Policy Service Release
 
 on:
   release:
-    types:
-      - published
-  workflow_dispatch:
-    inputs:
-      release_version:
-        description: Release version to promote when triggered manually
-        required: true
-        type: string
-      target_branch:
-        description: Branch the release is being promoted from
-        required: false
-        default: main
-        type: string
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
 
 jobs:
-  validate_release:
+  promote:
     runs-on: ubuntu-latest
-    outputs:
-      resolved_release_version: ${{ steps.resolve.outputs.release_version }}
+
     steps:
-      - name: Validate release metadata
-        id: resolve
-        shell: bash
+      - id: version
         run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            RELEASE_VERSION="${{ github.event.release.tag_name }}"
-            TARGET_BRANCH="${{ github.event.release.target_commitish }}"
-          else
-            RELEASE_VERSION="${{ inputs.release_version }}"
-            TARGET_BRANCH="${{ inputs.target_branch }}"
-          fi
+          TAG='${{ github.event.release.tag_name }}'
+          REGEX='^v[0-9]+\.[0-9]+\.[0-9]+(-((alpha|beta|rc)\.[0-9]+))?$'
 
-          if [[ ! "$RELEASE_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Invalid release version format: $RELEASE_VERSION. Expected v<major>.<minor>.<patch>" >&2
+          if [[ ! "$TAG" =~ $REGEX ]]; then
+            echo "Invalid tag format: $TAG"
             exit 1
           fi
 
-          if [ "$TARGET_BRANCH" != "main" ]; then
-            echo "Release must target main branch. Current target: $TARGET_BRANCH" >&2
-            exit 1
-          fi
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
 
-          echo "release_version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-  release:
-    needs: validate_release
-    uses: Insurance-Policy-Management-Org/insurance-policy-management/.github/workflows/reusable-release-template.yaml@main
-    with:
-      service_name: policy-service
-      helm_chart_path: policy-service
-      release_version: ${{ needs.validate_release.outputs.resolved_release_version }}
-    secrets:
-      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: image
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+
+          IMAGE=ghcr.io/$OWNER/policy-service
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+          echo "Using image: $IMAGE"
+
+      - id: sha
+        run: |
+          TAG='${{ github.event.release.tag_name }}'
+
+          SHA=$(git rev-list -n 1 "$TAG")
+          SHORT_SHA="${SHA::7}"
+
+          echo "sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag $TAG -> commit $SHA -> short $SHORT_SHA"
+
+      - name: Promote image
+        run: |
+          IMAGE=${{ steps.image.outputs.image }}
+          SHA=${{ steps.sha.outputs.sha }}
+          VERSION=${{ steps.version.outputs.version }}
+
+          echo "Pulling image: $IMAGE:$SHA"
+          docker pull $IMAGE:$SHA
+
+          echo "Tagging image: $IMAGE:$VERSION"
+          docker tag $IMAGE:$SHA $IMAGE:$VERSION
+
+          echo "Pushing image with retry..."
+          for i in 1 2 3; do
+            docker push $IMAGE:$VERSION && break || sleep 5
+          done
